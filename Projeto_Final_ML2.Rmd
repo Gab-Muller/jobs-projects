@@ -1,0 +1,902 @@
+---
+title: "Projeto Integrador - Olimpíadas"
+author: "Alexandre Krausz, Bruno Lira, Felipe Castelar, Gabriel Croquer, Gabriel Muller"
+date: "2025-06-08"
+output: html_document
+---
+
+![](simbolo_olimpico.png)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introdução
+
+O trabalho é composto por uma análise não supervisionada e uma supervisionada de bases de dados de **Olimpíadas**. Foi feito uma análise de Cluster para o agrupamento de esportes, com base na média de idade, altura, peso dos atletas medalhistas na modalidade. Em seguida, uma análise supervisionada, que consiste um modelo de classificação com base nos dados dos atletas da modalidade de atletismo **100 metros rasos masculinos**, com o objetivo de prever se um atleta será ou não medalhista com base em seu biotipo e origem.
+
+## Importação das bibliotecas
+
+```{r Installing and importing libraries and data}
+library(tidyverse)
+library(tidymodels)
+library(plotmo)
+library(rsample)
+library(plotmo)
+library(rpart)
+library(skimr)
+library(cluster)
+library(plotly)
+library(cluster)
+library(gapminder)  
+library(ggplot2) 
+library(yardstick)
+library(dplyr)
+library(vip)
+library(naniar)
+library(data.table)
+library(caret)
+library(randomForest)
+library(xgboost)
+
+df_athletes <- read_csv("world_olympedia_olympics_athlete_bio.csv")
+df_results <- read_csv("world_olympedia_olympics_athlete_event_result.csv")
+df_country <- read_csv("world_olympedia_olympics_country.csv")
+df_game <- read_csv("world_olympedia_olympics_game.csv")
+continents <- read_csv("Countries_by_continents_new.csv")
+```
+
+## Visualização dos dataframes
+
+Nossa base de dados possui diferentes bases:
+
+- `df_athletes`: características físicas de atletas: peso, ano de nascimento, altura, país
+
+- `df_results`: resultado por atleta e modalidade ao longo dos anos
+
+- `df_country`: país e abreviação, como BRA, Brasil
+
+- `df_game`: dados de cada edição de Olimpíada: ano, país sede, verão ou inverno
+
+- `continents`: país e continente ao qual ele pertence
+
+```{r Dados dos Atletas}
+df_athletes %>% head(1)
+```
+```{r Dados dos Resultados}
+df_results %>% head(1)
+```
+
+```{r Missing Values}
+df_country %>% head(1)
+```
+```{r Dados das Edições}
+df_game %>% head(1)
+```
+```{r Dados dos Continentes}
+
+continents %>% head(1)
+```
+
+## Dados faltantes
+
+O gráfico abaixo mostra os dados faltantes de cada coluna no `df_athletes`
+
+```{r Missing Values Visual}
+
+gg_miss_var(df_athletes) # dados faltantes por variável
+
+```
+
+## Remoção das colunas com muitos dados faltantes
+
+As colunas `description` e `special notes` do `df_athletes` consistem em colunas de texto com muitos dados faltantes.Portanto, podem ser desconsideradas no modelo.
+
+```{r Removendo col}
+df_athletes <- df_athletes %>% select(-description,-special_notes)
+df_results <- df_results %>% select(-position)
+```
+
+## Join nos data-frames
+
+Unimos o data-frame de atletas com o de resultados a partir da variável `athlete_id`. Dessa forma, nosso df resultante une as características físicas dos atletas com seus resultados nos jogos olímpicos
+
+```{r Join}
+df <- merge(df_athletes, df_results, by = "athlete_id")
+df <- df %>% select(-country_noc.y)
+df <- df %>% rename(noc = country_noc.x)
+
+df1<-df
+df<-df1
+```
+
+### Continentes e ano das edições
+Unimos o dataframe resultante com dados de continentes e ano das edições. 
+
+```{r Continentes}
+
+df <- merge(df, continents, by = "country")
+
+year <- df_game %>% select(year, edition_id)
+
+df <- merge(df, year, by = "edition_id")
+df <- df %>% select(-result_id)
+df_2<-df
+```
+
+### Filtro de esportes individuais e olimpíadas de verão
+Dado o objetivo de prever desempenhos individuais, desconsideramos os esportes coletivos, em que as equipes apresentam atletas com diferentes características.
+
+```{r Filtering}
+
+# Apenas esportes individuais
+df <- df %>%
+  filter(is_team_sport == FALSE) %>%
+  select(-is_team_sport)
+
+# Filtrando apenas esportes das olimpíadas de verão
+df <- df %>%
+  mutate(summer = if_else(str_detect(edition, "Summer"), 1, 0)) %>%
+  filter(summer == 1)
+df <- df %>% select(-summer,-edition)
+```
+
+## Tratamento de variáveis
+### Variável Resposta
+A variável resposta é binária (`medalist`: 1 caso o atleta foi medalhista na modalidade, 0 caso contrário.
+
+```{r Criando a variável resposta}
+df <- df %>% mutate(medal = if_else(is.na(medal), 0, 1))
+df <- df %>% rename(medalist = medal)
+```
+
+## Dados nulos e duplicados
+Removemos dados nulos e duplicados do df resultante.
+```{r Nulos}
+df <- drop_na(df)
+df <- distinct(df)
+```
+### Idade dos atletas
+Criamos a variável idade, que consiste na idade do atleta no momento de cada competição em que ele participou.
+```{r Variables}
+# Variável idade do atleta
+df <- df %>%
+  mutate(age = year - birth_year)
+
+df <- df %>% select(-year,-birth_year)
+
+df %>% head(1)
+
+df_previsao<-df
+```
+
+Dessa forma, o df tratado para as próximas etapas é composto pelas variáveis:
+
+| Variável      | Descrição                                                                 |
+|---------------|---------------------------------------------------------------------------|
+| edition_id    | Identificador da edição dos Jogos Olímpicos                               |
+| country       | Nome do país representado pelo atleta                                     |
+| athlete_id    | Identificador único do atleta                                             |
+| name          | Nome completo do atleta                                                   |
+| sex           | Sexo do atleta (Male ou Female)                                           |
+| birth_date    | Data de nascimento                                                        |
+| height        | Altura (em centímetros)                                                   |
+| weight        | Peso (em quilogramas)                                                     |
+| noc           | Código olímpico do país (ex: GER para Alemanha)                          |
+| sport         | Modalidade esportiva (ex: Athletics)                                      |
+| event         | Evento específico dentro da modalidade (ex: Long Jump, Men)              |
+| athlete       | Nome do atleta (coluna redundante com `name`, se não tratada)             |
+| medalist      | Indicador de medalhista (1 = medalhista, 0 = não medalhista)              |
+| continent     | Continente ao qual o país pertence (ex: Europe)                          |
+| age           | Idade do atleta no momento da competição                                  |
+
+
+# Clusterização
+
+Criamos um modelo **K means** não supervisionado com o intuito de segmentar diversas modalidades em clusters de acordo com o biotipo dos atletas olímpicos **medalhistas** de cada modalidade. 
+
+O objetivo é agrupar modalidades cujos medalistas apresentam características semelhantes. Para isso, coletamos a média de altura, peso e idade dos atletas olímpicos para cada modalidade incluída no treinamento do modelo. Os modelos foram segmentados entre atletas masculinos e femininos, utilizando as 30 modalidades mais frequentes para cada gênero.
+
+```{r separando homem e mulher para clusterização}
+# Separando os dados de atletas masculinos e femininos
+df_M <- df %>% filter(sex == 'Male') %>% select(-sex)
+df_F <- df %>% filter(sex == 'Female') %>% select(-sex)
+```
+```{r top_events}
+# Pegando os 30 eventos masculinos e femininos que ocorreram com mais frequência
+top_events_M <- df_M %>%
+  count(event, sort = TRUE) %>%
+  slice_head(n = 30)
+
+top_events_M_list<-top_events_M %>% pull(event)
+
+df_M <- df_M %>% filter(event %in% top_events_M_list)
+
+top_events_F <- df_F %>%
+  count(event, sort = TRUE) %>%
+  slice_head(n = 30)
+
+top_events_F_list<-top_events_F %>% pull(event)
+
+df_F <- df_F %>% filter(event %in% top_events_F_list)
+
+top_events_M %>% head(5)
+```
+
+## Cluster dos Atletas Masculinos
+
+### Preparação do DF para Cluster
+Nessa etapa:
+
+- Filtramos os atletas medalhistas das modalidades selecionadas;
+
+- Reduzimos cada modalidade para uma linha, com a média de **idade, peso e altura** dos atletas;
+
+- Normalizamos as medidas numéricas.
+
+```{r Cluster Esportes Homens}
+
+# Filtrando dados de atletas medalhistas
+df_medal_M <- df_M %>% filter(medalist == 1) %>% select(event, height, weight, age) 
+
+head(df_medal_M, 10)
+
+#agrupando os eventos com base na media das características
+df_medal_M <- df_medal_M %>%
+  group_by(event) %>%
+  summarise(
+    media_idade  = mean(age, na.rm = TRUE),
+    media_altura = mean(height, na.rm = TRUE),
+    media_peso   = mean(weight, na.rm = TRUE),
+    contagem = n()
+  ) %>%
+  ungroup()
+
+df_medal_M <- df_medal_M %>%
+  arrange(desc(media_idade))
+
+#Padronizar os dados
+df_cluster_M <- df_medal_M %>% select(event, media_idade, media_altura, media_peso) %>% mutate(across(where(is.numeric), scale))
+
+df_cluster_M %>% head(1)
+```
+
+
+### Gráfico de Cotovelo
+
+
+```{r Cotovelo}
+#df_cluster_bkp_M <- df_cluster_M
+#df_cluster_M <- df_cluster_M %>% select(-event)
+#df_cluster_M <- df_cluster_bkp_M
+
+set.seed(123)
+
+#Gráfico de cotovelo
+k <- 2:20
+tibble(k = k) %>% 
+  mutate(w = map_dbl(k, ~ kmeans(df_cluster_M %>%select(-event), centers = .x,
+                                 nstart = 10)$tot.withinss)) %>% 
+  ggplot(aes(k, w)) + 
+  geom_point() + 
+  scale_x_continuous(breaks = k) +
+  geom_line()
+```
+
+Pela visualização do gráfico de cotovelo, o valor de K poderia ser igual a 5 ou 6. Porém, optamos por 4 pelo nível de complexidade (número de variáveis e observações) dos nosso dados.
+
+### Criação dos Clusters
+```{r Cluster M}
+
+dados_para_cluster_M <- df_cluster_M %>% select(-event) %>%  as.data.frame()
+set.seed(123)
+kmeans_resultado_M <- kmeans(dados_para_cluster_M, centers = 4, nstart = 10)
+
+df_cluster_M <- df_cluster_M %>%
+  mutate(cluster = factor(kmeans_resultado_M$cluster))
+
+```
+
+Retornamos os valores das variaveis anteriormente normalizadas, para facilitar a visualização dos resultados do modelo.
+
+```{r Retornar dados originais}
+#retornando aos dados originais
+df_cluster_M_Final = merge(df_cluster_M, df_medal_M, by = "event")
+df_cluster_M_Final %>% head(5)
+
+df_cluster_M_Final <- df_cluster_M_Final %>% select(-media_idade.x,-media_peso.x,-media_altura.x) %>% rename(media_idade = media_idade.y, media_peso = media_peso.y,media_altura=media_altura.y)
+
+df_cluster_M_Final %>% head(5)
+```
+
+Os gráficos abaixo nos permitem visualizar a divisão de cada cluster gerado pelo modelo de acordo com as variáveis utilizadas. Em seguida, interpretamos os resultados a partir de exemplos relacionados a cada grupo.
+
+```{r Visualização Cluster M,echo=FALSE}
+# Visualização do resultado da segmentação dos dados com Kmeans
+df_cluster_M_Final %>% 
+  rownames_to_column() %>% 
+  ggplot(aes(x = media_peso, y = media_idade, label = rowname, color = as.factor(cluster))) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_point(size = 3) + 
+  # geom_text_repel() +  # descomente se quiser texto
+  labs(
+    title = "Idade x Peso - Modalidades Masculinas",
+    color = "cluster"
+  )
+
+```
+
+```{r Visualização Cluster Masc}
+# Visualização do resultado da segmentação dos dados com Kmeans
+df_cluster_M_Final %>% 
+  rownames_to_column() %>% 
+  ggplot(aes(x = media_peso, y = media_altura, label = rowname, color = as.factor(cluster))) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_point(size = 3) + 
+  # geom_text_repel() +  # descomente se quiser texto
+  labs(
+    title = "Altura x Peso - Modalidades Masculinas",
+    color = "cluster"
+  )
+
+```
+
+```{r Gráfico CM,echo=FALSE}
+df_long <- df_cluster_M_Final %>%
+  select(cluster, media_idade, media_altura, media_peso) %>%
+  pivot_longer(cols = -cluster, names_to = "variavel", values_to = "valor")
+
+# Gráfico
+ggplot(df_long, aes(x = variavel, y = valor, fill = factor(cluster))) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge") +
+  labs(title = "Avaliação cluster _ Homens", x = "Variável", y = "Valor médio", fill = "Cluster") +
+  theme_minimal()
+```
+
+Exemplos de esportes de cada Cluster:
+
+```{r Cluster Esportes Masc}
+df_cluster_M_Final %>%
+  group_by(cluster) %>%
+  slice_head(n = 3) %>%
+  select(cluster, event)
+```
+
+
+## Cluster das Atletas Femininas
+Realizamos o mesmo processo anterior para clusterizar os esportes de acordo com as modalidades femininas.
+
+### Preparando o dataframe para Cluster
+```{r Cluster Esportes Feminino, echo=FALSE}
+
+# Filtrando dados de atletas medalhistas
+df_medal_F <- df_F %>% filter(medalist == 1) %>% select(event, height, weight, age) 
+
+#agrupando os eventos com base na media das características
+df_medal_F <- df_medal_F %>%
+  group_by(event) %>%
+  summarise(
+    media_idade  = mean(age, na.rm = TRUE),
+    media_altura = mean(height, na.rm = TRUE),
+    media_peso   = mean(weight, na.rm = TRUE),
+    contagem = n()
+  ) %>%
+  ungroup()
+
+df_medal_F <- df_medal_F %>%
+  arrange(desc(media_idade))
+
+#Padronizar os dados
+df_cluster_F <- df_medal_F %>% select(event, media_idade, media_altura, media_peso) %>% mutate(across(where(is.numeric), scale))
+
+dados_para_cluster_F <- df_cluster_F %>% select(-event) %>%  as.data.frame()
+
+set.seed(123)
+
+kmeans_resultado_F <- kmeans(dados_para_cluster_F, centers = 4, nstart = 10)
+
+df_cluster_F <- df_cluster_F %>%
+  mutate(cluster = factor(kmeans_resultado_F$cluster))
+
+df_cluster_F_Final = merge(df_cluster_F, df_medal_F, by = "event")
+
+df_cluster_F_Final <- df_cluster_F_Final %>% select(-media_idade.x,-media_peso.x,-media_altura.x) %>% rename(media_idade = media_idade.y, media_peso = media_peso.y,media_altura=media_altura.y)
+
+# Visualização do resultado da segmentação dos dados com Kmeans
+df_cluster_F_Final %>% 
+  rownames_to_column() %>% 
+  ggplot(aes(x = media_peso, y = media_idade, label = rowname, color = as.factor(cluster))) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_point(size = 3) + 
+  # geom_text_repel() +  # descomente se quiser texto
+  labs(
+    title = "Idade x Peso - Modalidades Femininas",
+    color = "cluster"
+  )
+```
+
+```{r Cluster Esportes Fem - Visualização,echo=FALSE}
+df_cluster_F_Final %>% 
+  rownames_to_column() %>% 
+  ggplot(aes(x = media_peso, y = media_altura, label = rowname, color = as.factor(cluster))) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_point(size = 3) + 
+  # geom_text_repel() +  # descomente se quiser texto
+  labs(
+    title = "Altura x Peso - Modalidades Femininas",
+    color = "cluster"
+  )
+
+```
+
+```{r Gráfico CF, echo=FALSE}
+df_long_F <- df_cluster_F_Final %>%
+  select(cluster, media_idade, media_altura, media_peso) %>%
+  pivot_longer(cols = -cluster, names_to = "variavel", values_to = "valor")
+
+# Gráfico
+ggplot(df_long_F, aes(x = variavel, y = valor, fill = factor(cluster))) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge") +
+  labs(title = "Avaliação cluster _ Mulheres", x = "Variável", y = "Valor médio", fill = "Cluster") +
+  theme_minimal()
+```
+
+## Análise do resultado dos clusters
+
+Em ambos os modelos a segmentação dos clusters seguiu a seguinte lógica:
+
+- O cluster primeiro cluster possui atletas mais leves, baixos e jovens. Nele se encontra diversas modalidades da ginástica artística/rítmica e também modalidades longas do atletismo (como a maratona).
+
+- O segundo cluster conta com atletas mais altos e pesados comparados a outros clusters, e neles temos eventos que exigem altura ou força, como os 100 metros freestyle da natação e o heavyweight do UFC.
+
+- Já o terceiro cluster conta com atletas mais medianos, sendo mais altos e pesados que alguns clusters mas não atingem a primeira e a última posição em nenhum quesito.
+
+- Por fim, o cluster 4 possui uma característica única que é a média de idade dos medalhistas, sendo ela consideravelmente superior a média de idade nos outros clusters. Nesse cluster temos por exemplo, uma modalidade do hipismo.
+
+### Exemplos
+
+O cluster 1 é composto por esportes que favorecem atletas mais leves, baixos e jovens. Estão em modalidades como a corrida de 10 mil metros, 5 mil metros e ginástica artística.
+![](cluster1.jpeg)
+
+
+Além disso, no Cluster 2, estão as modalidadses vencidas por atletas mais alto e pesados. Os esportes que se classificados nele foram 100 metros na natação e a categoria pesos-pesado de lutas.
+![](cluster2.jpeg)
+
+
+No Cluster 3, estão os atletas mais "medianos" em relação à altura, idade e peso.
+![](cluster3.jpeg)
+
+
+Por fim, o Cluster 4 é composto por esportes vencidos por atletas mais velhos, mas medianos no peso e altura. Um exemplo é o hipismo.
+![](cluster4.jpeg)
+
+# Classificação
+Iniciamos filtrando os dados para apenas eventos da corrida 100 metros masculino, que é o objetivo de análise da classificação.
+
+```{r classificação 100 metros rasos masculino}
+library(themis)
+library(keras)
+library(recipes)
+library(dplyr)
+library(tidyr)
+
+# criando dataframe df_corrida para utilizar no modelo supervisionado
+
+df_corrida<-df_previsao %>%
+  filter(event=='100 metres, Men')
+
+df_corrida <- df_corrida %>% select(-birth_date,-edition_id)
+
+df_corrida %>% head(5)
+```
+
+Reduzimos o dataframe dos atletas com participações mais de um evento para uma linha por atleta, com a sua média de altura, idade e peso entre as participações.
+
+```{r reduzindo os dados dos atletas}
+
+df_corrida <- df_corrida %>% 
+  group_by(athlete) %>% 
+  summarise(
+    age = mean(age, na.rm = TRUE),
+    medalist = as.integer(any(medalist == 1)),
+    height = first(height),
+    weight = first(weight),
+    continent = first(continent),
+    country=first(country)
+  )
+
+
+df_corrida %>% head(5)
+```
+
+## Novas variáveis
+Observamos que 50% dos atletas medalhistas na modalidade são atletas americanos. Por isso, criamos uma variável binária dizendo se ele é ou não dos EUA.
+```{r visualizando países com mais medalhas no evento}
+
+# criando dataframe df_corrida para utilizar no modelo supervisionado
+
+df_corrida %>%
+  filter(medalist == 1) %>% 
+  count(country) %>%
+  mutate(porcentagem = n / sum(n) * 100) %>%
+  arrange(desc(porcentagem)) %>%
+  head(5)
+
+df_corrida <- df_corrida %>%
+  mutate(american = ifelse(country == "United States", 1, 0))
+```
+
+```{r boxplot_idade,echo=FALSE}
+# Supondo que seu dataframe seja chamado df_corrida
+
+ggplot(df_corrida, aes(x = factor(medalist), y = age)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  labs(
+    x = "Medalhista (0 = Não, 1 = Sim)",
+    y = "Idade",
+    title = "Distribuição da Idade por Status de Medalhista"
+  ) +
+  theme_minimal()
+```
+
+
+```{r boxplot_altura, echo=FALSE}
+# Supondo que seu dataframe seja chamado df_corrida
+
+ggplot(df_corrida, aes(x = factor(medalist), y = height)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  labs(
+    x = "Medalhista (0 = Não, 1 = Sim)",
+    y = "Altura",
+    title = "Distribuição da altura por Status de Medalhista"
+  ) +
+  theme_minimal()
+```
+
+```{r barra_empilhada_proporcao,echo=FALSE, message=FALSE, warning=FALSE}
+df_stacked <- df_corrida %>%
+  group_by(medalist, american) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Gráfico de barras empilhadas com contagem absoluta
+ggplot(df_stacked, aes(x = factor(medalist), y = n, fill = factor(american))) +
+  geom_bar(stat = "identity", width = 0.6, color = "black") +
+  scale_fill_manual(
+    values = c("gray70", "steelblue"),
+    labels = c("Não americano", "Americano")
+  ) +
+  labs(
+    x = "Medalhista (0 = Não, 1 = Sim)",
+    y = "Número de Atletas",
+    fill = "Origem",
+    title = "Distribuição de Americanos e Não Americanos por Status de Medalhista"
+  ) +
+  theme_minimal()
+```
+
+## TidyModels
+```{r Modelos supervisionados - TidyModels}
+
+set.seed(42)
+
+# 1. Seleção das variáveis
+dados <- df_corrida %>%
+  mutate(
+    medalist = as.factor(medalist),
+    american = as.factor(american),
+    continent = as.factor(continent)
+  ) %>%
+  select(all_of(c("age", "weight", "height", "american", "medalist", "continent")))
+
+dados %>%filter(medalist==1) %>% head(5)
+```
+
+## Processamento inicial
+Normalizamos as variáveis numéricas e balancaemos a classe `medalist` no conjunto de treino
+
+```{r Modelos supervisionados - Preparação e Receita}
+
+# treinamento x teste -----------------------------------------------------
+set.seed(321)
+
+split1 <- initial_split(dados, prop = 0.7, strata = "medalist")
+split2 <- initial_split(dados, prop = 0.8, strata = "medalist")
+
+treinamento <- training(split2) # treinamento
+validacao <- testing(split2) # validacao
+teste <- testing(split1) # teste
+
+# processamento -----------------------------------------------------------
+
+receita_treino <- recipe(medalist ~ ., treinamento) %>% # define a receita, com a variavel resposta e os dados de treinamento
+  step_normalize(all_numeric(),-all_of("american")) %>% #normaliza todas variaveis numerias 
+  step_dummy(continent) %>% 
+  themis::step_upsample(medalist)
+  # define variavel dummy a variavel student
+
+receita <- recipe(medalist ~ ., treinamento) %>% # define a receita, com a variavel resposta e os dados de treinamento
+  step_normalize(all_numeric(),-all_of("american")) %>% #normaliza todas variaveis numerias 
+  step_dummy(continent) # define variavel dummy a variavel student
+
+receita_treino_prep<-prep(receita_treino)
+receita_prep <- prep(receita) # prepara a receita definida acima
+
+treinamento_proc <- bake(receita_treino_prep, new_data = NULL) # obtem os dados de treinamento processados
+validacao_proc <- bake(receita_prep, new_data = validacao) # obtem os dados de validacao processados
+teste_proc <- bake(receita_prep, new_data = teste) # obtem os dados de teste processados
+
+treinamento_proc %>% head(5)
+```
+
+## Regressão Logística
+Inicialmente, implementamos um modelo de regressão logística com a engine "glm"
+
+```{r GLM}
+fit_glm <- logistic_reg() %>% # define um modelo de regressao logistica
+  set_engine("glm") %>% # define a engine do modelo
+  set_mode("classification") %>% # define que e'  problema de classificacao
+  fit(medalist ~ ., treinamento_proc) # executa o modelo e estima os parametros
+
+
+fit_glm # estimativas do modelo ajustado
+
+tidy(fit_glm) # estimativas do modelo ajustado em formato tidy
+
+fitted <- fit_glm %>% 
+  predict(new_data = validacao_proc, type = "prob") %>% # realiza predicao para os dados de teste
+  mutate(observado = validacao_proc$medalist, # cria uma coluna com o valor observado de default
+         modelo = "logistica") # cria uma coluna para indicar qual o modelo ajustado
+```
+
+## Random Forest
+O segundo modelo testado foi a Random Forest, com tuning por meio de validação cruzada
+
+```{r rf}
+library(tidymodels)
+
+cv_split <- vfold_cv(treinamento, v = 10, strata = "medalist")
+# Define modelo com parâmetros a serem tunados
+rf_model <- rand_forest(
+  mtry = tune(),         # número de variáveis consideradas em cada split
+  min_n = tune(),        # número mínimo de observações em um nó terminal
+  trees = 500            # número de árvores fixo
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+# Tuning via validação cruzada
+rf_tune <- tune_grid(
+  rf_model,
+  receita,             
+  resamples = cv_split,
+  grid = 30,           # número de combinações de hiperparâmetros a testar
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Visualiza métricas
+rf_tune %>% collect_metrics()
+
+# Seleciona a melhor combinação de hiperparâmetros com base no ROC AUC
+best_rf <- rf_tune %>% select_best(metric="roc_auc")
+
+# Ajusta o modelo final com os melhores parâmetros
+fit_rf <- finalize_model(rf_model, best_rf) %>%
+  fit(medalist ~ ., data = treinamento_proc)
+
+# Previsões no conjunto de validação
+fitted_rf <- fit_rf %>%
+  predict(new_data = validacao_proc, type = "prob") %>%
+  mutate(observado = validacao_proc$medalist,
+         modelo = "random_forest")
+
+# Empilha as previsões no tibble 'fitted'
+fitted <- fitted %>%
+  bind_rows(fitted_rf)
+
+fitted %>% tail(50)
+fitted_1<-fitted
+```
+
+## Rede Neural
+O modelo de rede neural possui 2 camadas internas, com a função de ativação Relu. Além disso, foram utilizadas 20 épocas durante o treinamento do modelo.
+
+```{r rede neural,results='hide',eval=FALSE}
+
+treinamento_proc_NN <- treinamento_proc
+validacao_proc_NN <- validacao_proc
+
+# Transformar a variável resposta em binária (0 ou 1)
+treinamento_proc_NN$medalist <- as.numeric(treinamento_proc_NN$medalist) - 1
+treinamento_proc_NN$american <- as.numeric(treinamento_proc_NN$american) - 1
+validacao_proc_NN$medalist <- as.numeric(validacao_proc_NN$medalist) - 1
+validacao_proc_NN$american <- as.numeric(validacao_proc_NN$american) - 1
+
+# Separar preditores e resposta
+x_train <- as.matrix(select(treinamento_proc_NN, -medalist))
+y_train <- as.matrix(treinamento_proc_NN$medalist)
+
+x_val <- as.matrix(select(validacao_proc_NN, -medalist))
+y_val <- as.matrix(validacao_proc_NN$medalist)
+
+# Definir o modelo Keras
+modelo_keras <- keras_model_sequential() %>%
+  layer_dense(units = 16, activation = "relu", input_shape = ncol(x_train)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 8, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid") # saída binária
+
+# Compilar o modelo
+modelo_keras %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+
+# Treinar o modelo
+history <- modelo_keras %>% fit(
+  x = x_train,
+  y = y_train,
+  epochs = 20,
+  batch_size = 32,
+  validation_data = list(x_val, y_val),
+  verbose = 1
+)
+```
+
+![](NeuralNet.png)
+Ambas as curvas de Loss diminuem ao longo das épocas, o que indica que o modelo está aprendendo e convergindo bem. Além disso, a val_accuracy está consistentemente acima da accuracy, o que também reforça a capacidade de generalização.
+
+```{r Previsão RF, eval=FALSE}
+# Previsão de probabilidades
+prob_pred <- modelo_keras %>% predict(x_val)
+
+# Converter para tibble com observados
+fitted_keras <- tibble(
+  .pred_1 = as.vector(prob_pred),
+  observado = y_val,
+  modelo = "rede_neural"
+)
+
+head(fitted_keras)
+
+fitted_1<-fitted %>% 
+  mutate(observado=as.numeric(observado)-1) %>% 
+  select(.pred_1, observado, modelo)
+
+fitted_keras <- fitted_keras %>%
+  mutate(observado = as.numeric(as.character(observado)))
+
+fitted_1 <- fitted_1 %>%
+  bind_rows(fitted_keras)
+
+fitted_1 %>% head(5)
+```
+
+```{r Rf = 1,eval=FALSE}
+fitted_keras %>%
+  arrange(desc(.pred_1)) %>% head(5)
+```
+
+## Avaliação
+
+```{r Avaliação}
+trashold<-0.5
+fitted_1 <- fitted_1 %>%
+  mutate(pred_class = if_else(.pred_1 >= trashold, 1, 0), # binariza a predição
+         observado = as.numeric(observado))            # garante que ambos são fatores/strings
+
+fitted_1 %>% group_by(modelo) %>% count()
+fitted_1 %>% head(5)
+
+```
+
+
+```{r Avaliação ROC, echo=FALSE}
+library(dplyr)
+library(yardstick)
+library(pROC)
+library(ggplot2)
+library(purrr)
+
+roc_df <- fitted_1 %>%
+  group_by(modelo) %>%
+  group_split() %>%
+  map_df(~ {
+    roc_obj <- pROC::roc(response = .x$observado, predictor = .x$.pred_1)
+    tibble(
+      modelo = unique(.x$modelo),
+      fpr = 1 - roc_obj$specificities,
+      tpr = roc_obj$sensitivities,
+      auc = as.numeric(pROC::auc(roc_obj))
+    )
+  })
+
+labels_auc <- roc_df %>%
+  group_by(modelo) %>%
+  summarise(auc = unique(auc)) %>%
+  mutate(label = paste0(modelo, " (AUC = ", round(auc, 3), ")"))
+
+ggplot(roc_df, aes(x = fpr, y = tpr, color = modelo)) +
+  geom_line(size = 1.3) +
+  geom_abline(linetype = "dashed") +
+  labs(
+    title = "Curva ROC por Modelo",
+    x = "1 - Especificidade (FPR)",
+    y = "Sensibilidade (TPR)",
+    color = "modelo"
+  ) +
+  scale_color_manual(
+    values = c("logistica" = "red", "random_forest" = "green", "rede_neural" = "blue"),
+    labels = labels_auc$label
+  ) +
+  theme_minimal()
+```
+
+```{r Modelos supervisionados,echo=FALSE}
+# Calcula as métricas
+metricas_df <- fitted_1 %>%
+  mutate(
+    observado = factor(observado, levels = c(0, 1)),
+    pred_class = factor(pred_class, levels = c(0, 1))
+  ) %>%
+  group_by(modelo) %>%
+  summarise(
+    acuracia = accuracy_vec(observado, pred_class),
+    sensibilidade = recall_vec(observado, pred_class),
+    especificidade = specificity_vec(observado, pred_class),
+    precisao = precision_vec(observado, pred_class),
+    f1 = f_meas_vec(observado, pred_class)
+  )
+
+metricas_df
+
+```
+
+```{r Metricas, echo=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 1. Transformar para formato longo e padronizar para escala 0–100
+metricas_long <- metricas_df %>%
+  pivot_longer(
+    cols = -modelo,
+    names_to = "metrica",
+    values_to = "valor"
+  ) %>%
+  mutate(valor = valor * 100)
+
+# 2. Plotar gráficos separados com legendas (facets)
+ggplot(metricas_long, aes(x = modelo, y = valor, fill = modelo)) +
+  geom_col(width = 0.8, show.legend = TRUE) +
+  geom_text(
+    aes(label = round(valor, 1)),
+    vjust = -0.3,
+    size = 3
+  ) +
+  facet_wrap(~ metrica, scales = "fixed") +
+  labs(
+    title = "Métricas de Desempenho por Modelo",
+    x = NULL,
+    y = "Valor (%)",
+    fill = "Modelo"
+  ) +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_blank(),  # remove os nomes no eixo X
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+
+```
+
+## Conclusão
+O modelo escolhido como o melhor, foi a **rede neural**. Apesar do Random Forest ter apresentado uma acurácia geral e uma sensibilidade levemente superiores, o modelo apresentou uma especificidade extremamente baixa, de apenas 50%, tendo uma grande dificuldade de identificar corretamente os atletas que não serão medalhistas. Em outras palavras, é um modelo exageradamente otimista que comete muitos falsos positivos.
+Por outro lado a rede neural possui uma especificidade superior, além de alcançar uma precisão extremamente alta de 98,4%, que reforça sua confiabilidade em prever corretamente quem será medalhista. Portanto, a rede neural possui melhor capacidade de equilíbrio em identificar corretamente medalhistas e não medalhistas.
+
